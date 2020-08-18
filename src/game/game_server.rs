@@ -50,7 +50,7 @@ impl GameServerActor {
         // Generate a 2048-bit Rsa key pair
         let rsa = Rsa::generate(2048).unwrap();
         // Prepare DER representation
-        let der = rsa.public_key_to_der().unwrap();
+        let der = rsa.public_key_to_pem_pkcs1().unwrap();
         Self {
             address: addr.into(),
             encryption: (rsa, der.into()).into(),

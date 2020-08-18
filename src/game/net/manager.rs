@@ -66,11 +66,19 @@ impl NetManagerActor {
         let stream = std::mem::replace(&mut self.stream, None).unwrap();
 
         let (rh, wh) = stream.into_split();
-        let recv_actor = super::receiver::NetReceiverActor::new(rh, self.encryption.clone());
-        let send_actor = super::sender::NetSenderActor::new(wh);
 
-        let (mut recv_handle, recv_jh) = recv_actor.spawn();
+        // Spawn Send Actor
+        let send_actor = super::sender::NetSenderActor::new(wh);
         let (mut send_handle, send_jh) = send_actor.spawn();
+
+        // Spawn Receive Actor
+        let recv_actor = super::receiver::NetReceiverActor::new(
+            rh,
+            self.encryption.clone(),
+            send_handle.clone(),
+            self.address.clone(),
+        );
+        let (mut recv_handle, recv_jh) = recv_actor.spawn();
 
         tokio::pin! {
             let recv_finished = recv_jh;
