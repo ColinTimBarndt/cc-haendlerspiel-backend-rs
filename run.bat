@@ -1,0 +1,5 @@
+RUST_BACKTRACE=1
+OPENSSL_DIR=C:\Program Files\OpenSSL-Win64
+OPENSSL_STATIC=1
+cargo run
+exit
