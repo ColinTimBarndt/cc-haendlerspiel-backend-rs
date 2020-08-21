@@ -1,11 +1,13 @@
+use std::fmt;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use openssl::rsa::Rsa;
+use tokio_rustls::TlsAcceptor;
+
+use crate::game::GameServerHandle;
 
 // Structures
 
@@ -15,11 +17,11 @@ pub struct NetManagerHandle {
     sender: mpsc::Sender<NetManagerMessage>,
 }
 
-#[derive(Debug)]
 pub struct NetManagerActor {
     pub address: SocketAddr,
     pub stream: Option<TcpStream>,
-    encryption: Arc<(Rsa<openssl::pkey::Private>, Vec<u8>)>,
+    tls_acceptor: Option<TlsAcceptor>,
+    server: GameServerHandle,
 }
 
 #[derive(Debug)]
@@ -28,6 +30,16 @@ enum NetManagerMessage {
 }
 
 // Implementations
+
+impl fmt::Debug for NetManagerActor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NetManagerActor")
+            .field("address", &self.address)
+            .field("stream", &self.stream)
+            .field("tls_acceptor", &self.tls_acceptor.as_ref().map(|_| "<...>"))
+            .finish()
+    }
+}
 
 impl NetManagerHandle {
     pub async fn stop_actor(&mut self) {
@@ -42,12 +54,14 @@ impl NetManagerActor {
     pub fn new(
         address: SocketAddr,
         stream: TcpStream,
-        encryption: Arc<(Rsa<openssl::pkey::Private>, Vec<u8>)>,
+        tls_acceptor: TlsAcceptor,
+        gs_handle: GameServerHandle,
     ) -> Self {
         Self {
             address,
             stream: Some(stream),
-            encryption,
+            tls_acceptor: Some(tls_acceptor),
+            server: gs_handle,
         }
     }
     pub fn spawn(self) -> (NetManagerHandle, JoinHandle<NetManagerActor>) {
@@ -65,18 +79,33 @@ impl NetManagerActor {
         use futures::future::FutureExt;
         let stream = std::mem::replace(&mut self.stream, None).unwrap();
 
-        let (rh, wh) = stream.into_split();
+        // Establish TLS
+        let acceptor = std::mem::replace(&mut self.tls_acceptor, None).unwrap();
+        let stream = match acceptor.accept(stream).await {
+            Err(e) => {
+                eprintln!(
+                    "(⚠) TLS handshake with {addr} failed: {err}",
+                    addr = self.address,
+                    err = e
+                );
+                return self;
+            }
+            Ok(s) => s,
+        };
+
+        // Split into actors
+        let (rh, wh) = tokio::io::split(stream);
 
         // Spawn Send Actor
-        let send_actor = super::sender::NetSenderActor::new(wh);
+        let send_actor = super::sender::NetSenderActor::new(wh, self.address.clone());
         let (mut send_handle, send_jh) = send_actor.spawn();
 
         // Spawn Receive Actor
         let recv_actor = super::receiver::NetReceiverActor::new(
             rh,
-            self.encryption.clone(),
             send_handle.clone(),
             self.address.clone(),
+            self.server.clone(),
         );
         let (mut recv_handle, recv_jh) = recv_actor.spawn();
 
@@ -121,11 +150,10 @@ impl NetManagerActor {
             }
         }
 
-        let (rh, wh) = (
-            recv_actor.unwrap().read_half.into_inner(),
-            send_actor.unwrap().write_half,
-        );
-        let stream = rh.reunite(wh).unwrap();
+        // Shutdown connection
+        let (rh, wh): (tokio::io::ReadHalf<_>, _) =
+            (recv_actor.unwrap().into(), send_actor.unwrap().into());
+        let (stream, _session) = rh.unsplit(wh).into_inner();
         drop(stream.shutdown(std::net::Shutdown::Both));
         self.stream = Some(stream);
 

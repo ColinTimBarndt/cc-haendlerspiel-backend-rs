@@ -1,5 +1,5 @@
 use super::{
-  serial::{SerialRead, SerialWrite},
+  serial::{PacketString, SerialRead, SerialWrite},
   IngoingPacket, OutgoingPacket, State,
 };
 
@@ -19,10 +19,7 @@ impl SerialWrite for PingStatusPacket {
   fn write_consume(self, buf: &mut Vec<u8>) {
     SerialWrite::write_consume(self.players, buf);
     SerialWrite::write_consume(self.games, buf);
-
-    debug_assert!(self.status.len() <= 0xff_ff_ff_ff);
-    SerialWrite::write_consume(self.status.len() as u32, buf);
-    buf.append(&mut self.status.into_bytes());
+    SerialWrite::write_consume(PacketString::from(self.status), buf);
   }
 }
 

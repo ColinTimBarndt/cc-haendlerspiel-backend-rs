@@ -1,13 +1,15 @@
 # Network Traffic Protocol
 
-The Haendlerspiel-Protocol (HSP) uses TCP for network communication.
-Packets are sent over the streams using the following encoding specification.
+The Haendlerspiel-Protocol (HSP) uses TCP with TLS encryption for network communication.
+Packets are serialized using the following specification.
 If there is any error in the connection, the connection is immediately shut
 down.
 
 ## Data Types
 
-Each packet is encoded using the following data types:
+Each packet is encoded using the following data types. Note that all numeric types
+are using LITTLE ENDIAN byte order and not big endian. This choice was made because
+LE is the native byte order of most modern processors.
 
 | Type   | Bytes | Description                     |
 | ------ | ----: | ------------------------------- |
@@ -42,26 +44,31 @@ Each packet is encoded using the following data types:
 
 ## Packet format
 
-| Type  | Description                                             |
-| ----- | ------------------------------------------------------- |
-|       | **Packet Header**                                       |
-| `u16` | Packet type identifier                                  |
-| `u32` | Packet body length (bytes)                              |
-|       | **Packet Body**                                         |
-| ?     | Depends on the [packet type](#Packet%20Types) and state |
+| Type  | Description                                           |
+| ----- | ----------------------------------------------------- |
+|       | **Packet Header**                                     |
+| `u16` | Packet type identifier                                |
+| `u32` | Packet body length (bytes)                            |
+|       | **Packet Body**                                       |
+| ?     | Depends on the [packet type](#Packet-Types) and state |
 
 ## Packet Types
 
 Here is a list of all possible packet types and the state they are bound to.
 Each connection has the initial state `Handshake`.
 
-| State     |  ID | Bound to | Packet Documentation                                   |
-| --------- | --: | -------- | ------------------------------------------------------ |
-| Handshake |   0 | Server   | [Handshake](#Handshake%20Packet)                       |
-| Ping      |   0 | Client   | [Ping Status](#Ping%20Status%20Packet)                 |
-| Ping      |   1 | Both     | [Ping Pong](#Ping%20Pong%20Packet)                     |
-| Encrypt   |   0 | Client   | [Request Encryption](#Request%20Encryption%20Packet)   |
-| Encrypt   |   0 | Server   | [Encryption Response](#Encryption%20Response%20Packet) |
+| State         |  ID | Bound to | Documentation                            |
+| ------------- | --: | -------- | ---------------------------------------- |
+| **Handshake** |     |          |                                          |
+| Handshake     |   0 | Server   | [Handshake](#Handshake-Packet)           |
+| **Ping**      |     |          |                                          |
+| Ping          |   0 | Client   | [Ping Status](#Ping-Status-Packet)       |
+| Ping          |   1 | Both     | [Ping Pong](#Ping-Pong-Packet)           |
+| **Login**     |     |          |                                          |
+| Login         |   0 | Client   | [List Games](#List-Games-Packet)         |
+| Login         |   0 | Server   | [Sync Games](#Sync-Games-Packet)         |
+| Login         |   1 | Server   | [Login](#Login-Packet)                   |
+| Login         |   1 | Client   | [Login Response](#Login-Response-Packet) |
 
 ### Handshake Packet
 
@@ -72,9 +79,9 @@ Each connection has the initial state `Handshake`.
 Possible values for the next state are:
 
 - 1: Changes the connection state to `Ping` and sends a
-  [Ping Status](#Ping%20Status%20Packet) Packet.
-- 2: Changes the connection state to `Encrypt` and sends a
-  [Request Encryption](#Request%20Encryption%20Packet) Packet.
+  [Ping Status](#Ping-Status-Packet) Packet.
+- 2: Changes the connection state to `Login` and sends a
+  [List Games](#List-Games-Packet) Packet.
 
 ### Ping Status Packet
 
@@ -96,43 +103,58 @@ The client may use this behavior to measure the connection speed
 to the server. If the client does not want to do this, it can
 just close the connection.
 
-### Request Encryption Packet
+### List Games Packet
 
-| Type      | Description                   |
-| --------- | ----------------------------- |
-| `u32`     | Length of public RSA key DER  |
-| `u8` \* n | Public RSA key encoded in DER |
-| `u32`     | Length of verification key    |
-| `u8` \* n | Verification key              |
+| Type       | Description                               |
+| ---------- | ----------------------------------------- |
+| `u32`      | Number of entries                         |
+| Entry \* n | [Entry Data](#List-Games-Entry-Data-Type) |
 
-The server sends this packet when enabling encryption. The cipher used
-is `AES 128 CFB8`. The client has to respond to this packet with an
-[Encryption Response](#Encryption%20Response) Packet.
+Sent when entering `Login`-state and every time the list changes.
+If a game entry is removed that the client never had registered, then
+the client should ignore it and send a [Sync Games](#Sync-Games-Packet)
+Packet to notify the server that it should re-send all entries.
 
-### Encryption Response Packet
+#### List Games Entry Data Type
 
-| Type      | Description                |
-| --------- | -------------------------- |
-| `u32`     | Length of verification key |
-| `u8` \* n | Encrypted verification key |
-| `u32`     | Length of shared secret    |
-| `u8` \* n | Encrypted shared secret    |
+| Type   | Description            |
+| ------ | ---------------------- |
+| `u64`  | Identifier of the game |
+| `u8`   | 0: Add, 1: Remove      |
+|        | **If Add**             |
+| `name` | Name of the game       |
+| `u32`  | Player count           |
 
-The client response this packet to activate `AES 128 CFB8` encryption.
-To verify that the public key was transferred correctly, the verification
-key has to be encrypted using it. The client also has to generate a
-shared secret (which should be 128 bytes long) and encrypt it using the
-same public key.
+### Sync Games Packet
 
-If the encryption fails, the server immediately terminates the connection.
-If it succeeds, any bytes sent after this packet are encrypted using the
-cipher and the state is set to `Login`. The server will respond with an
-[Encryption Success](#Encryption%20Success%20Packet) Packet.
+| Type | Description    |
+| ---- | -------------- |
+|      | _Empty packet_ |
 
-Note that the cipher is only updated and never reset for the next packet.
+The client should send this packet if the server unregisteres a
+game that the client did not know existed. It tells the server
+to re-send all existing games.
 
-### Encryption Success Packet
+### Login Packet
 
-| Type  | Description         |
-| ----- | ------------------- |
-| `u32` | Always `0xDEADBEEF` |
+| Type   | Description |
+| ------ | ----------- |
+| `name` | Username    |
+| `name` | Password    |
+
+Log in as an existing user. Only logged in users are able to create
+game instances. A user can log out by sending empty strings for
+both fields. Every user that is not logged in is a `Guest`.
+
+### Login Response Packet
+
+| Type | Description      |
+| ---- | ---------------- |
+| `u8` | Permission level |
+
+The server response to a login by sending the users new permission
+level (0: Guest, 1: Moderator, 2: Administrator).
+If the level is 0, the login information was false.
+
+In case both username and password were empty, a permission level
+response of 0 indicates that the user has successfully logged off.

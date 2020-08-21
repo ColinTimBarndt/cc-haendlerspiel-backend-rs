@@ -1,10 +1,13 @@
 use std::error::Error;
+use structopt::StructOpt;
 
 pub mod game;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let game_server = game::GameServerActor::new(([127, 0, 0, 1], 25252));
+    let options = game::config::Options::from_args();
+
+    let game_server = game::GameServerActor::new(([127, 0, 0, 1], 25252), options.load()?);
     let (mut handle, join_handle) = game_server.spawn();
 
     wait_ctrl_c_signal().await;

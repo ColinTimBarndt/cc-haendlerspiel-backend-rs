@@ -3,10 +3,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
-use openssl::rsa::Rsa;
+use tokio_rustls::{
+    rustls::{Certificate, PrivateKey, ServerConfig},
+    TlsAcceptor,
+};
 
 use super::*;
 
@@ -18,12 +21,9 @@ pub struct GameServerHandle {
     sender: mpsc::Sender<GameServerMessage>,
 }
 
-#[derive(Debug)]
 pub struct GameServerActor {
     address: SocketAddr,
-    /// Shared immutable reference to the public and private key.
-    /// The public key is also stored using DER.
-    encryption: Arc<(Rsa<openssl::pkey::Private>, Vec<u8>)>,
+    tls_acceptor: TlsAcceptor,
     /// Shared mutable HashMap containing all active connections.
     connections: Arc<Mutex<HashMap<SocketAddr, net::NetManagerHandle>>>,
     games: HashMap<u64, GameHandle>,
@@ -32,44 +32,71 @@ pub struct GameServerActor {
 #[derive(Debug)]
 enum GameServerMessage {
     StopActor,
+    GetGames(oneshot::Sender<Vec<(u64, GameHandle)>>),
 }
 
 // Implementations
+
+const ACTOR_DROPPED_MESSAGE: &'static str = "GameServerActor was dropped, oopsie!";
 
 impl GameServerHandle {
     pub async fn stop_actor(&mut self) {
         self.sender
             .send(GameServerMessage::StopActor)
             .await
-            .expect("GameServerActor was dropped, oopsie!")
+            .expect(ACTOR_DROPPED_MESSAGE)
+    }
+    pub async fn get_games(&mut self) -> Vec<(u64, GameHandle)> {
+        let (send, recv) = oneshot::channel();
+        self.sender
+            .send(GameServerMessage::GetGames(send))
+            .await
+            .expect(ACTOR_DROPPED_MESSAGE);
+        recv.await.expect(ACTOR_DROPPED_MESSAGE)
+    }
+}
+
+impl std::fmt::Debug for GameServerActor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GameServerActor")
+            .field("address", &self.address)
+            .field("connections", &self.connections)
+            .field("games", &self.games)
+            .field("tls_acceptor", &"<...>")
+            .finish()
     }
 }
 
 impl GameServerActor {
-    pub fn new<A: Into<SocketAddr>>(addr: A) -> Self {
-        // Generate a 2048-bit Rsa key pair
-        let rsa = Rsa::generate(2048).unwrap();
-        // Prepare DER representation
-        let der = rsa.public_key_to_pem_pkcs1().unwrap();
+    pub fn new<A: Into<SocketAddr>>(addr: A, encryption: (Vec<Certificate>, PrivateKey)) -> Self {
+        let mut tls_config = ServerConfig::new(tokio_rustls::rustls::NoClientAuth::new().into());
+        tls_config
+            .set_single_cert(encryption.0, encryption.1)
+            .unwrap();
         Self {
             address: addr.into(),
-            encryption: (rsa, der.into()).into(),
+            tls_acceptor: TlsAcceptor::from(Arc::from(tls_config)),
             games: HashMap::new(),
             connections: Mutex::new(HashMap::new()).into(),
         }
     }
     pub fn spawn(self) -> (GameServerHandle, JoinHandle<GameServerActor>) {
         let (send, recv) = mpsc::channel(1024);
+        let handle = GameServerHandle {
+            sender: send,
+            address: self.address,
+        };
 
         (
-            GameServerHandle {
-                sender: send,
-                address: self.address,
-            },
-            tokio::spawn(async move { self.actor(recv).await }),
+            handle.clone(),
+            tokio::spawn(async move { self.actor(recv, handle).await }),
         )
     }
-    async fn actor(mut self, mut recv: mpsc::Receiver<GameServerMessage>) -> Self {
+    async fn actor(
+        mut self,
+        mut recv: mpsc::Receiver<GameServerMessage>,
+        game_server_handle: GameServerHandle,
+    ) -> Self {
         use futures::FutureExt;
 
         let mut net_listener = TcpListener::bind(self.address)
@@ -82,7 +109,9 @@ impl GameServerActor {
                 msg = recv.recv().fuse() => {
                     match msg {
                         None => return self.stop_net().await,
-                        Some(GameServerMessage::StopActor) => return self.stop_net().await,
+                        Some(msg) => if !self.process_msg(msg) {
+                            return self.stop_net().await
+                        },
                     }
                 },
                 con_res = net_listener.accept().fuse() => {
@@ -92,7 +121,7 @@ impl GameServerActor {
                             continue;
                         }
                         Ok((stream, address)) => {
-                            self.accept_net(stream, address);
+                            self.accept_net(stream, address, game_server_handle.clone());
                             continue;
                         }
                     }
@@ -130,9 +159,15 @@ impl GameServerActor {
         self
     }
     /// Accepts a network connection socket
-    fn accept_net(&mut self, stream: TcpStream, addr: SocketAddr) {
+    fn accept_net(
+        &mut self,
+        stream: TcpStream,
+        addr: SocketAddr,
+        game_server_handle: GameServerHandle,
+    ) {
         println!("(ℹ) [+] Connection from {}", addr);
-        let actor = net::NetManagerActor::new(addr, stream, self.encryption.clone());
+        let actor =
+            net::NetManagerActor::new(addr, stream, self.tls_acceptor.clone(), game_server_handle);
         let (handle, jh) = actor.spawn();
 
         let cons_mutex = self.connections.clone();
@@ -158,5 +193,22 @@ impl GameServerActor {
             lock.remove(&addr);
             drop(lock);
         });
+    }
+    /// Processes an actor message and returns if the actor should continue listening
+    fn process_msg(&mut self, msg: GameServerMessage) -> bool {
+        match msg {
+            GameServerMessage::StopActor => false,
+            GameServerMessage::GetGames(cb) => {
+                drop(
+                    cb.send(
+                        self.games
+                            .iter()
+                            .map(|(id, gh)| (*id, gh.clone()))
+                            .collect(),
+                    ),
+                );
+                true
+            }
+        }
     }
 }

@@ -109,3 +109,128 @@ macro_rules! impl_write {
 impl_write!(u16:2:read_u16, u32:4:read_u32, u64:4:read_u64, u128:4:read_u128);
 impl_write!(i16:2:read_i16, i32:4:read_i32, i64:4:read_i64, i128:4:read_i128);
 impl_write!(f32:4:read_f32, f64:8:read_f64);
+
+// Strings
+
+macro_rules! impl_string {
+  ($T:ident , $LT:ty) => {
+    #[derive(Clone)]
+    pub struct $T {
+      inner: String,
+    }
+
+    impl From<String> for $T {
+      fn from(s: String) -> Self {
+        Self { inner: s }
+      }
+    }
+
+    impl From<$T> for String {
+      fn from(s: $T) -> Self {
+        s.inner
+      }
+    }
+
+    impl std::ops::Deref for $T {
+      type Target = String;
+      fn deref(&self) -> &String {
+        &self.inner
+      }
+    }
+
+    impl SerialRead for $T {
+      fn read(data: &mut &[u8]) -> Result<Self, ()> {
+        let len: usize = {
+          use std::convert::TryInto;
+          let len: $LT = SerialRead::read(data)?;
+          len.try_into().map_err(|_| ())?
+        };
+        let s_data = &data[..len];
+        *data = &data[len..];
+        Ok(String::from_utf8(Vec::from(s_data)).map_err(|_| ())?.into())
+      }
+    }
+
+    impl SerialWrite for $T {
+      fn write_consume(self, buf: &mut Vec<u8>) {
+        use std::convert::TryInto;
+        SerialWrite::write_consume(
+          {
+            let l: $LT = self
+              .inner
+              .len()
+              .try_into()
+              .expect("String length exceeds limits of u32");
+            l
+          },
+          buf,
+        );
+        buf.extend(self.inner.into_bytes());
+      }
+    }
+  };
+}
+
+impl_string!(PacketString, u32);
+impl_string!(PacketNameString, u8);
+
+// Lists
+
+#[derive(Clone)]
+pub struct PacketList<T> {
+  inner: Vec<T>,
+}
+
+impl<T> From<Vec<T>> for PacketList<T> {
+  fn from(inner: Vec<T>) -> Self {
+    Self { inner }
+  }
+}
+
+impl<T> From<PacketList<T>> for Vec<T> {
+  fn from(s: PacketList<T>) -> Self {
+    s.inner
+  }
+}
+
+impl<T> std::ops::Deref for PacketList<T> {
+  type Target = Vec<T>;
+  fn deref(&self) -> &Vec<T> {
+    &self.inner
+  }
+}
+
+impl<T: SerialRead> SerialRead for PacketList<T> {
+  fn read(data: &mut &[u8]) -> Result<Self, ()> {
+    let len: usize = {
+      use std::convert::TryInto;
+      let len: u32 = SerialRead::read(data)?;
+      len.try_into().map_err(|_| ())?
+    };
+    let mut vec: Vec<T> = Vec::with_capacity(len);
+    for _ in 0..len {
+      vec.push(SerialRead::read(data)?);
+    }
+    Ok(vec.into())
+  }
+}
+
+impl<T: SerialWrite> SerialWrite for PacketList<T> {
+  fn write_consume(self, buf: &mut Vec<u8>) {
+    use std::convert::TryInto;
+    SerialWrite::write_consume(
+      {
+        let l: u32 = self
+          .inner
+          .len()
+          .try_into()
+          .expect("Vec length exceeds limits of u32");
+        l
+      },
+      buf,
+    );
+    for e in self.inner {
+      SerialWrite::write_consume(e, buf);
+    }
+  }
+}
